@@ -1,0 +1,219 @@
+---
+title: "CMIP5 vs. REMO2015 — Warming-Level Differences"
+subtitle: "MPI-ESM-LR, RCP8.5 (tasmax-only metrics)"
+format:
+  revealjs:
+    embed-resources: true
+    width: 1400
+    height: 900
+    fig-width: 13
+    fig-height: 7
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(stars)
+library(sf)
+library(rnaturalearth)
+library(colorspace)
+
+sf_use_s2(FALSE)
+
+source("gcs_io.R")
+
+gs_to_vsigs <- function(gs_uri) str_replace(gs_uri, "^gs://", "/vsigs/")
+
+COMPARISON_PREFIX <- "gs://clim_data_reg_useast1/cmip5/comparisons_remo2015/warming_level_aggregates"
+MODEL <- "MPI-ESM-LR"
+WARMING_LEVELS <- c(0.5, 1, 2, 3)
+WL_LABELS <- c("+0.5\u00b0C", "+1\u00b0C", "+2\u00b0C", "+3\u00b0C")
+STATS <- c("p05", "p50", "p95")
+
+# metric_name -> unit label for the legend title
+METRICS <- tribble(
+  ~metric_name,                   ~unit,
+  "days-above-32c",               "days",
+  "days-above-35c",               "days",
+  "days-above-38c",               "days",
+  "days-above-45c",               "days",
+  "days-above-50c",               "days",
+  "average-daytime-temperature",  "\u00b0C",
+  "ten-hottest-days",             "\u00b0C",
+  "freezing-days",                "days"
+)
+
+DOMAINS <- c("AFR", "AUS", "CAM", "CAS", "EAS", "EUR", "NAM", "SAM", "SEA", "WAS")
+
+# Natural Earth land polygons (110m), used to clip every map to land area.
+# st_union() requires s2 off to avoid invalid-polygon errors on this dataset.
+land <- ne_countries(scale = 110, returnclass = "sf") |> st_union()
+
+#' REMO2015's native lon convention differs by domain:
+#'  - EUR etc. are already -180/180 on a clean offset+delta grid.
+#'  - CAM, SAM, NAM sit entirely on the 0-360 side above 180 (e.g. CAM is
+#'    235.7-337.9) -- a simple -360 shift maps them onto a single, still-
+#'    contiguous -180/180 block.
+#'  - AUS and EAS actually straddle the antimeridian (e.g. AUS 89.2-206.6,
+#'    EAS 51.4-181.8): shifting the >180 portion by -360 would split the
+#'    domain into two disjoint longitude clusters while still claiming a
+#'    single uniform offset+delta, corrupting the coordinate mapping (this
+#'    is what produced the garbled AUS/EAS maps). Since we only care about
+#'    the western (<180) part of these domains, that portion is cropped out
+#'    instead of wrapped.
+#' In all cases the lon dimension is also regularized to a true offset+delta
+#' grid (source files store it as irregular interval/bounds).
+fix_lon <- function(x) {
+  centers <- st_get_dimension_values(x, "lon", center = TRUE)
+  delta <- diff(centers)[1]
+  crs <- st_crs(x)
+
+  set_regular_lon <- function(x, idx, new_centers) {
+    xi <- x[, idx, , ]
+    xi <- st_set_dimensions(xi, "lon", offset = new_centers[1] - delta / 2, delta = delta)
+    st_crs(xi) <- crs
+    xi
+  }
+
+  if (max(centers, na.rm = TRUE) <= 180) {
+    # Already -180/180; still regularize in case it's bounds-encoded.
+    return(set_regular_lon(x, seq_along(centers), centers))
+  }
+
+  if (min(centers, na.rm = TRUE) > 180) {
+    # Entirely on the shifted side (CAM, SAM, NAM): a plain -360 shift keeps
+    # the domain contiguous.
+    new_lon <- centers - 360
+    return(set_regular_lon(x, seq_along(centers), new_lon))
+  }
+
+  # Straddles the antimeridian (AUS, EAS): keep only the western (<180) part.
+  keep <- which(centers < 180)
+  set_regular_lon(x, keep, centers[keep])
+}
+
+#' Load one metric/domain comparison NetCDF (CMIP5 - REMO2015 differences,
+#' already computed by scripts/compare_cmip5_remo2015.R), clip to land, and
+#' reshape into a long tibble ready for plotting.
+load_comparison_df <- function(metric_name, domain) {
+  uri <- str_glue(
+    "{COMPARISON_PREFIX}/{metric_name}/{metric_name}_{domain}_{MODEL}_CMIP5-vs-REMO2015_rcp85_wls.nc"
+  )
+  x <- read_mdim(gs_to_vsigs(uri)) |> suppressWarnings()
+  st_crs(x) <- 4326
+  x <- fix_lon(x)
+
+  x_land <- x[land]
+
+  x_land |>
+    select(all_of(STATS)) |>
+    as_tibble() |>
+    mutate(wl = as.numeric(wl)) |>
+    filter(if_any(all_of(STATS), ~ !is.na(.x))) |>
+    pivot_longer(all_of(STATS), names_to = "stat", values_to = "value") |>
+    mutate(
+      stat = factor(stat, levels = STATS),
+      wl_label = factor(wl, levels = WARMING_LEVELS, labels = WL_LABELS)
+    )
+}
+
+#' Build one comparison slide's map: 4 warming-level columns x 3 stat rows,
+#' a binned divergent fill clipped to the 10th/95th percentile of the data
+#' shown (with out-of-range extremes folded into the end bins and labelled).
+plot_comparison <- function(df, metric_name, domain, unit) {
+  lims <- quantile(df$value, c(0.05, 0.95, 0.01, 0.99), na.rm = TRUE, type = 1)
+  lo <- unname(lims[1])
+  hi <- unname(lims[2])
+
+  # Guard against a degenerate (collapsed) scale range, e.g. a metric/domain
+  # where the 5th/95th percentiles are identical (differences ~0 almost
+  # everywhere, common for rare-event metrics like days-above-50c); falling
+  # back to the literal min/max here would blow the legend out to a handful
+  # of extreme outlier cells, so widen to the 1st/99th percentile first and
+  # only fall back to the true range (then +/-1 padding) as a last resort.
+  if (!is.finite(lo) || !is.finite(hi) || hi <= lo) {
+    lo <- unname(lims[3])
+    hi <- unname(lims[4])
+    if (!is.finite(lo) || !is.finite(hi) || hi <= lo) {
+      rng <- range(df$value, na.rm = TRUE)
+      lo <- rng[1]
+      hi <- rng[2]
+      if (!is.finite(lo) || !is.finite(hi) || hi <= lo) {
+        lo <- lo - 1
+        hi <- hi + 1
+      }
+    }
+  }
+
+  ggplot(df, aes(lon, lat, fill = value)) +
+    geom_raster() +
+    facet_grid(stat ~ wl_label) +
+    colorspace::scale_fill_binned_diverging(
+      palette = "Blue-Red 3",
+      limits = c(lo, hi),
+      oob = scales::squish,
+      n.breaks = 9,
+      name = str_glue("   {unit}"),
+      # labels = \(x) {
+      #   if(unit != "days") {
+      #     x <- as.character(x)
+      #     x[1] <- x[1] |> as.numeric() |> round(1) |> as.character()
+      #     x[length(x)] <- x[length(x)] |> as.numeric() |> round(1) |> as.character()
+      #   } else {
+      #     x <- round(x)
+      #   }
+      #   x
+      # },
+      guide = guide_colorsteps(
+        barwidth = unit(14, "cm"),
+        barheight = unit(0.3, "cm"),
+        # show.limits = T,
+        title.position = "right"
+      )
+    ) +
+    scale_x_continuous(breaks = scales::breaks_pretty(n = 4)) +
+    scale_y_continuous(breaks = scales::breaks_pretty(n = 4)) +
+    coord_fixed() +
+    labs(title = str_glue("{metric_name} \u2014 {domain}"), x = NULL, y = NULL,
+    subtitle = "CMIP5 \u2212 REMO2015 (MPI-ESM-LR)",
+    caption = str_glue("1, 99th perc.: {round(lims[3])}, {round(lims[4])}")) +
+    theme(legend.position = "bottom",
+    legend.ticks = element_line(color = "white", linewidth = 1),
+    legend.ticks.length = unit(0.3, "cm"))
+}
+```
+
+```{r}
+#| label: render-slides
+#| output: asis
+
+slide_specs <- tidyr::crossing(DOMAINS, METRICS) |>
+  rename(domain = DOMAINS)
+
+for (i in seq_len(nrow(slide_specs))) {
+  metric_name <- slide_specs$metric_name[i]
+  domain <- slide_specs$domain[i]
+  unit <- slide_specs$unit[i]
+
+  # cat(str_glue("## {metric_name} — {domain}"), "\n\n")
+  cat("\n\n---\n\n") 
+
+  df <-  load_comparison_df(metric_name, domain)
+
+  if (nrow(df) == 0) {
+    # No non-NA cells for this metric/domain (e.g. no land overlap, or the
+    # whole comparison is NA) -- facet_grid() errors on zero-row/zero-level
+    # data, so skip plotting and note it instead.
+    cat(str_glue("*No data available for {metric_name} — {domain}.*"), "\n\n")
+  } else {
+    print(plot_comparison(df, metric_name, domain, unit))
+  }
+
+  cat("\n\n")
+}
+```
